@@ -6,6 +6,23 @@ import threading
 import json
 
 
+def _shell_env():
+    """Get a full shell environment so subprocess can find composer/php."""
+    env = os.environ.copy()
+    try:
+        path = subprocess.check_output(
+            ["/bin/zsh", "-lc", "echo $PATH"],
+            stderr=subprocess.DEVNULL,
+        ).decode("utf-8").strip()
+        env["PATH"] = path
+    except (subprocess.CalledProcessError, OSError):
+        pass
+    return env
+
+
+_ENV = _shell_env()
+
+
 class IdeHelperOnProjectOpen(sublime_plugin.EventListener):
     """Detect Laravel projects and manage ide-helper on project open."""
 
@@ -29,7 +46,9 @@ class IdeHelperOnProjectOpen(sublime_plugin.EventListener):
             return
 
         self._checked_roots.add(root)
-        threading.Thread(target=self._check, args=(root, window), daemon=True).start()
+        t = threading.Thread(target=self._check, args=(root, window))
+        t.daemon = True
+        t.start()
 
     @staticmethod
     def _check(root, window):
@@ -40,7 +59,7 @@ class IdeHelperOnProjectOpen(sublime_plugin.EventListener):
         try:
             with open(composer_json, "r") as f:
                 data = json.load(f)
-        except (json.JSONDecodeError, OSError):
+        except (ValueError, OSError):
             return
 
         require_dev = data.get("require-dev", {})
@@ -53,14 +72,18 @@ class IdeHelperOnProjectOpen(sublime_plugin.EventListener):
             return
 
         # Package is installed — run ide-helper generation in background
-        sublime.status_message("IDE Helper: refreshing…")
-        subprocess.run(
-            ["composer", "run", "post-update-cmd"],
-            cwd=root,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        )
-        sublime.status_message("IDE Helper: ready")
+        sublime.status_message("IDE Helper: refreshing...")
+        try:
+            subprocess.call(
+                ["composer", "run", "post-update-cmd"],
+                cwd=root,
+                env=_ENV,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            sublime.status_message("IDE Helper: ready")
+        except OSError:
+            sublime.status_message("IDE Helper: composer not found")
 
 
 def _prompt_install(window, root):
@@ -71,23 +94,30 @@ def _prompt_install(window, root):
 
     def on_select(index):
         if index == 0:
-            threading.Thread(
-                target=_install_and_configure, args=(root,), daemon=True
-            ).start()
+            t = threading.Thread(target=_install_and_configure, args=(root,))
+            t.daemon = True
+            t.start()
 
     window.show_quick_panel(items, on_select)
 
 
 def _install_and_configure(root):
-    sublime.status_message("IDE Helper: installing…")
+    sublime.status_message("IDE Helper: installing...")
 
-    result = subprocess.run(
-        ["composer", "require", "--dev", "barryvdh/laravel-ide-helper"],
-        cwd=root,
-        capture_output=True,
-        text=True,
-    )
-    if result.returncode != 0:
+    try:
+        proc = subprocess.Popen(
+            ["composer", "require", "--dev", "barryvdh/laravel-ide-helper"],
+            cwd=root,
+            env=_ENV,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        _, stderr = proc.communicate()
+    except OSError:
+        sublime.status_message("IDE Helper: composer not found")
+        return
+
+    if proc.returncode != 0:
         sublime.status_message("IDE Helper: composer require failed")
         return
 
@@ -112,7 +142,7 @@ def _install_and_configure(root):
         with open(composer_json, "w") as f:
             json.dump(data, f, indent=4)
             f.write("\n")
-    except (json.JSONDecodeError, OSError):
+    except (ValueError, OSError):
         sublime.status_message("IDE Helper: failed to update composer.json")
         return
 
@@ -135,11 +165,15 @@ def _install_and_configure(root):
         pass
 
     # Generate the helper files
-    sublime.status_message("IDE Helper: generating files…")
-    subprocess.run(
-        ["composer", "run", "post-update-cmd"],
-        cwd=root,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-    )
-    sublime.status_message("IDE Helper: installed and ready")
+    sublime.status_message("IDE Helper: generating files...")
+    try:
+        subprocess.call(
+            ["composer", "run", "post-update-cmd"],
+            cwd=root,
+            env=_ENV,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        sublime.status_message("IDE Helper: installed and ready")
+    except OSError:
+        sublime.status_message("IDE Helper: composer not found")
